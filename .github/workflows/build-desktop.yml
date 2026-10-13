@@ -1,0 +1,51 @@
+name: Build desktop installers
+
+on:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python with bundled Tk
+        run: |
+          curl -fL https://www.python.org/ftp/python/3.13.15/python-3.13.15-macos11.pkg -o /tmp/sony-python.pkg
+          echo '3b7eaf7f29825f796e8267024435540ddf1f17fc9a97ad58095daa7a75bfdcd3  /tmp/sony-python.pkg' | shasum -a 256 -c -
+          sudo installer -pkg /tmp/sony-python.pkg -target /
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+      - name: Build DMG
+        run: PYTHON_BIN=/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13 ./build-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sony-stabilizer-${{ matrix.runner }}
+          path: |
+            dist/Sony-Video-Stabilizer-macos-*.dmg
+            dist/Sony-Video-Stabilizer-macos-*.zip
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Install packaging tools
+        run: choco install ffmpeg innosetup --no-progress -y
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $env:PYTHON_BIN = (Get-Command python.exe).Source
+          ./build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sony-stabilizer-windows-x64
+          path: dist/Sony-Video-Stabilizer-Setup.exe
+          if-no-files-found: error
