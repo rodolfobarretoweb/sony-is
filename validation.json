@@ -1,0 +1,27 @@
+{
+  "analysis_size": [
+    640,
+    360
+  ],
+  "common_reliable_frame_pairs": 783,
+  "method": "Forward/backward LK features; RANSAC similarity motion; confidence >0.6 in all three videos. Acceleration is the first difference of consecutive center translations. RMS averages x and y components. Jitter uses a 2.4-frame Gaussian high-pass on integrated center translations. No zoom normalization; the new video is more tightly cropped (1.25x), so these values penalize its magnification. Previous export has variable zoom. These are motion proxies and include deliberate camera movement.",
+  "measurements": {
+    "original": {
+      "acceleration_rms_px_per_frame2": 1.3638478789841142,
+      "acceleration_norm_p95": 3.5752356662138527,
+      "high_pass_path_rms_px": 1.2439297790768995
+    },
+    "previous": {
+      "acceleration_rms_px_per_frame2": 0.5548096826706261,
+      "acceleration_norm_p95": 1.4715871651809687,
+      "high_pass_path_rms_px": 0.685919197873773
+    },
+    "final": {
+      "acceleration_rms_px_per_frame2": 0.335760847299462,
+      "acceleration_norm_p95": 0.49984264649465215,
+      "high_pass_path_rms_px": 0.6273653833872044
+    }
+  },
+  "acceleration_reduction_vs_previous_percent": 39.48179749076349,
+  "acceleration_reduction_vs_original_percent": 75.38135649339725
+}

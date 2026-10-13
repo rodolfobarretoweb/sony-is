@@ -1,0 +1,6 @@
+XML: C0033M01.XML frames=948 gyroscope=yes
+Video: 3840x2160 @ 23.976 fps, 948 frames
+Gyro: 79551 samples (~2012 Hz)
+Zoom: mean crop 5.4% / max 15.0% (per side, dynamic)
+  frame 0/948  frame 50/948  frame 100/948  frame 150/948  frame 200/948  frame 250/948  frame 300/948  frame 350/948  frame 400/948  frame 450/948  frame 500/948  frame 550/948  frame 600/948  frame 650/948  frame 700/948  frame 750/948  frame 800/948  frame 850/948  frame 900/948
+Done -> example/C0033_stabilized.MP4
