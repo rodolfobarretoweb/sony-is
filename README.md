@@ -1,12 +1,12 @@
 # Sony gyro stabilization
 
-Python stabilization for original Sony XAVC MP4s with an `rtmd` metadata track. Tested with the included **ZV-E10, 3840×2160, 24000/1001 fps** recording.
+Python stabilization for original Sony XAVC MP4s with an `rtmd` metadata track. The included **A7 IV, 1920×1080, 60000/1001 fps** recording has active in-body image stabilization (IBIS) and is supported.
 
-The `C0033M01.XML` sidecar identifies the camera, duration, and presence of gyro data. It **does not contain X/Y motion samples**. Those live inside `C0033.MP4`. Gyro values describe angular velocity, not pixel coordinates: this script converts them to camera orientation, then projects pixels using the lens and sensor geometry.
+The `C1394M01.XML` sidecar identifies the camera, duration, and presence of gyro data. It **does not contain X/Y motion samples**. Those live inside `C1394.MP4`. Gyro values describe angular velocity, not pixel coordinates: this script converts them to camera orientation, then projects pixels using the lens and sensor geometry. For IBIS footage, it also reads the sensor shift and roll recorded in the MP4 and applies them at each row's readout time.
 
 ## Desktop app
 
-The native desktop window lets you choose the camera original, its **Sony XML sidecar**, **Light**, **Balanced**, or **Strong** stabilization, and where to save the result. It shows processing progress and errors. The XML field fills automatically when the matching sidecar is beside the video, or you can browse for it elsewhere; it is optional because the gyro samples are in the original video. The app defaults to a new MOV file beside the original, **Balanced** stabilization, and visual refinement. The renderer preserves the source dimensions, targets its video bitrate, and copies its audio. Existing files are never replaced.
+The native desktop window lets you choose one or more camera originals, their **Sony XML sidecars**, **Light**, **Balanced**, or **Strong** stabilization, and where to save the first result. Select several MP4 or MOV files in the video picker to process them in order. Additional videos use their matching XML sidecars and save to new MOV files beside their originals. It shows processing progress and errors, and continues with the remaining videos if one fails. The XML field fills automatically when the matching sidecar is beside the first video, or you can browse for it elsewhere; it is optional because the gyro samples are in the original video. The app defaults to a new MOV file beside the original, **Balanced** stabilization, and visual refinement. The renderer preserves the source dimensions, targets its video bitrate, and copies its audio. Existing files are never replaced.
 
 The installable packages bundle Python, the stabilization libraries, FFmpeg, and ffprobe. No browser or separate Python installation is needed on the destination computer.
 
@@ -26,20 +26,20 @@ Requires Python 3.10+, FFmpeg and ffprobe on your PATH.
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python stabilize.py example/C0033.MP4 --refine
+.venv/bin/python stabilize.py example/C1394.MP4 --refine
 ```
 
-The matching XML is detected automatically. The default output is `example/C0033_stabilized_v2.mov`. MOV keeps the original PCM audio packaging for playback compatibility. Existing files are protected; choose `-o another.mov` or explicitly use `--overwrite` to replace an export. The original cannot be used as the output.
+The matching XML is detected automatically. The default output is `example/C1394_stabilized_v2.mov`. MOV keeps the original PCM audio packaging for playback compatibility. Existing files are protected; choose `-o another.mov` or explicitly use `--overwrite` to replace an export. The original cannot be used as the output.
 
-By default, encoding targets the **original video stream's bitrate** (about 98 Mbps for this clip), and **copies every original audio track without re-encoding**. There is no default CRF compression or AAC conversion. Stabilization requires decoding, warping, and re-encoding the video; it cannot leave the video bitstream unchanged. The original H.264 codec, 4K dimensions, frame rate, pixel format, color tags, and timecode are retained. Average bitrate can vary slightly with encoder rate control; the JSON report records both the source and measured output bitrate. The original gyro track is not copied onto altered images.
+By default, encoding targets the **original video stream's bitrate** (about 50 Mbps for the A7 IV clip), and **copies every original audio track without re-encoding**. There is no default CRF compression or AAC conversion. Stabilization requires decoding, warping, and re-encoding the video; it cannot leave the video bitstream unchanged. The original H.264 codec, dimensions, frame rate, pixel format, color tags, and timecode are retained. Average bitrate can vary slightly with encoder rate control; the JSON report records both the source and measured output bitrate. The original gyro track is not copied onto altered images.
 
-Encoding now also preserves the original **H.264 profile and level**, keeps the bitrate buffer within that level's limits, and inserts a closed keyframe every half-second. The first source-bitrate exports accidentally selected Level 6.1 instead of the camera's Level 5.1 because their buffer setting was oversized. Software decoding succeeded, but that alone did not establish compatibility with hardware playback. The corrected exports use High Level 5.1, two references, one B-frame, and no B-pyramid. They retain the source bitrate and original audio. MOV packaging avoids the newer `ipcm` audio sample entry introduced in the previous exports.
+Encoding preserves the source **H.264 profile and level**, keeps the bitrate buffer within that level's limits, and inserts a closed keyframe every half-second. The A7 IV sample uses High Level 4.2. It retains the source bitrate and original audio. MOV packaging preserves the camera's `twos` PCM audio entry.
 
 For less crop, choose a stabilization level:
 
 ```sh
-.venv/bin/python stabilize.py example/C0033.MP4 --refine --level balanced
-.venv/bin/python stabilize.py example/C0033.MP4 --refine --level light
+.venv/bin/python stabilize.py example/C1394.MP4 --refine --level balanced
+.venv/bin/python stabilize.py example/C1394.MP4 --refine --level light
 ```
 
 | Level | Maximum total crop | Crop at each edge | Smoothing | Default output suffix |
@@ -48,12 +48,12 @@ For less crop, choose a stabilization level:
 | `balanced` | 10% | 5% | 0.35 s | `_stabilized_balanced.mov` |
 | `strong` (default) | 20% | 10% | 0.50 s | `_stabilized_v2.mov` |
 
-Start with `balanced` to keep more of the original composition. `light` preserves the most field of view but leaves more camera movement. All levels ease correction when the crop budget is exhausted and keep a fixed zoom by default. The crop limit is a ceiling; clips with less movement may need less crop. Resolution stays at 4K unless `--width` is set: the retained picture is enlarged to fill the output.
+Start with `balanced` to keep more of the original composition. `light` preserves the most field of view but leaves more camera movement. All levels ease correction when the crop budget is exhausted and keep a fixed zoom by default. The crop limit is a ceiling; clips with less movement may need less crop. Resolution stays at the source size unless `--width` is set: the retained picture is enlarged to fill the output.
 
 For a custom limit, numeric options override the selected level. For example, this keeps balanced smoothing but allows at most 8% total crop:
 
 ```sh
-.venv/bin/python stabilize.py example/C0033.MP4 --refine --level balanced --max-crop 0.08 -o example/C0033_crop8.mov
+.venv/bin/python stabilize.py example/C1394.MP4 --refine --level balanced --max-crop 0.08 -o example/C1394_crop8.mov
 ```
 
 For another clip:
@@ -65,13 +65,13 @@ For another clip:
 A faster, smaller preview:
 
 ```sh
-.venv/bin/python stabilize.py example/C0033.MP4 --refine --width 1280 -o example/preview.mov
+.venv/bin/python stabilize.py example/C1394.MP4 --refine --width 1280 -o example/preview.mov
 ```
 
 Analyze without rendering, and save diagnostics:
 
 ```sh
-.venv/bin/python stabilize.py example/C0033.MP4 --refine --analyze-only --report analysis.json
+.venv/bin/python stabilize.py example/C1394.MP4 --refine --analyze-only --report analysis.json
 ```
 
 ## Controls
@@ -100,21 +100,9 @@ Audio is always copied, including the camera's original PCM audio. MOV is now th
 - Decode and write frames sequentially, handle short pipe reads, reject truncated frames, check FFmpeg exit status, and verify encoded frame count. Failed renders do not replace a completed output.
 - Stream decoded frames instead of loading an entire clip into RAM.
 
-The previous Python script is preserved at `tmp/stabilize_previous.py`; the previous video export is untouched.
+The included `validation.json` contains motion measurements from earlier ZV-E10 testing. Motion measurements are proxies for visible shake, not a guarantee of perceptual quality. Pans, parallax, independent subject movement, and tracking failures affect them. Stabilization cannot remove blur already recorded during an exposure or reconstruct hidden image borders.
 
-## Included results
-
-- `example/C0033_balanced_compatible.mov`: corrected 4K High Level 5.1 export targeting the original bitrate, with copied PCM audio and 10% total crop.
-- `example/C0033_light_compatible.mov`: corrected 4K High Level 5.1 export targeting the original bitrate, with copied PCM audio and 6% total crop.
-- The earlier `*_source_bitrate.mp4` files have the Level 6.1 compatibility issue and are superseded by `*_compatible.mov`.
-- The older `C0033_stabilized_v2.mp4`, `C0033_stabilized_balanced.mp4`, and `C0033_stabilized_light.mp4` exports used CRF 18 and AAC audio. They remain available for comparison; changing the defaults does not modify an existing file.
-- `example/C0033_comparison.mp4`: original on the **left**, new result on the **right**.
-- `example/C0033_stabilized_v2.json`: timing, crop, tracking and render diagnostics.
-- `validation.json`: motion measurements on matching, reliably tracked 640×360 analysis frames, without zoom normalization, with methodology.
-
-The motion measurements are proxies for visible shake, not a guarantee of perceptual quality. Pans, parallax, independent subject movement, and tracking failures affect them. Stabilization cannot remove blur already recorded during an exposure or reconstruct hidden image borders. The rapid movements in this clip therefore still look less clean than its stationary sections.
-
-This version targets original, continuous, constant-frame-rate Sony clips. It rejects active IBIS/OSS tables and does not implement Sony's full lens distortion or electronic stabilization mesh. Edited footage, other camera axis layouts, or in-camera stabilization modes need separate validation. At clip boundaries, orientation sampling clamps to the available gyro interval.
+This version targets original, continuous, constant-frame-rate Sony clips. It supports the A7 IV sample's IBIS position and roll tables; active lens OSS remains unsupported. It does not implement Sony's full lens distortion or electronic stabilization mesh. Edited footage, other camera axis layouts, or other in-camera stabilization modes need separate validation. At clip boundaries, orientation and IBIS sampling clamp to the available recorded interval.
 
 ## Verification
 

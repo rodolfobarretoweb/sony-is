@@ -1,5 +1,6 @@
 """Regression checks for geometry, timing, crop continuity, and safe video IO."""
 import io
+from pathlib import Path
 import struct
 import unittest
 from unittest.mock import patch
@@ -8,7 +9,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 import stabilize as s
-from sony_metadata import camera_rates, parse_tags, Telemetry
+from sony_metadata import camera_rates, load_telemetry, motion_table, parse_tags, Telemetry
 
 
 class StabilizationTests(unittest.TestCase):
@@ -97,6 +98,42 @@ class StabilizationTests(unittest.TestCase):
         np.testing.assert_array_equal(camera_rates(np.array([[10., 20., 30.]]), 0x412), [[-20, 10, 30]])
         with self.assertRaises(ValueError):
             camera_rates(np.zeros((1, 3)), 0x999)
+
+    def test_ibis_tables_validate_lengths_and_signed_samples(self):
+        tags = {0xe40f: struct.pack('>IIiiii', 1, 16, -25, -78000, 181000, 0)}
+        np.testing.assert_array_equal(motion_table(tags, 0xe40f, 16, '>iiii'),
+                                      [[-25, -78000, 181000, 0]])
+        tags[0xe40f] = tags[0xe40f][:-1]
+        with self.assertRaisesRegex(ValueError, 'motion table'):
+            motion_table(tags, 0xe40f, 16, '>iiii')
+
+    def test_ibis_shift_and_roll_are_applied_at_source_row(self):
+        frame = self.frame()
+        rows = np.zeros((s.ROW_NODES, 3))
+        rows[:, 0] = np.linspace(0, 8, s.ROW_NODES)
+        rows[:, 1] = -3
+        frame.ibis = rows
+        p = frame.map(np.array([[80., 0.], [80., 96.]]), 1)
+        self.assertGreater(p[1, 0] - p[0, 0], 7.5)
+        self.assertTrue(np.all(p[:, 1] < np.array([0., 96.])))
+        baseline = frame.map(np.array([[120., 48.]]), 1)[0, 1]
+        rows[:, 2] = np.radians(1)
+        self.assertGreater(frame.map(np.array([[120., 48.]]), 1)[0, 1], baseline)
+
+    def test_a7iv_example_has_usable_ibis_samples(self):
+        clip = Path(__file__).parent / 'example' / 'C1394.MP4'
+        if not clip.exists():
+            self.skipTest('A7 IV camera sample is not installed')
+        telemetry = load_telemetry(clip, 2, 1920, 1080)
+        self.assertEqual(len(telemetry.pts), 420)
+        self.assertEqual(len(telemetry.ibis_times), 1680)
+        self.assertTrue(np.all(np.diff(telemetry.ibis_times) > 0))
+        self.assertTrue(np.all(np.isfinite(telemetry.ibis)))
+        self.assertAlmostEqual(telemetry.ibis_times[0], 47 / 1_000_000)
+        np.testing.assert_allclose(telemetry.ibis[0],
+                                  [78000 / 5120 * 1920 / 6140,
+                                   181000 / 5120 * 1080 / 3454,
+                                   -np.deg2rad(812 / 1000)])
 
     def test_pure_yaw_correction_direction(self):
         frame = self.frame()

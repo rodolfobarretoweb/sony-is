@@ -68,10 +68,11 @@ def rodrigues(rv):
 class Frame:
     """Everything needed to map output pixels of one frame to input pixels."""
 
-    def __init__(self, K, Kinv, W, H, D, rows_rv):
+    def __init__(self, K, Kinv, W, H, D, rows_rv, ibis_rows=None):
         self.K, self.Kinv, self.W, self.H = K, Kinv, W, H
         self.D = D                      # raw -> stabilized correction (3x3)
         self.rv = rows_rv               # (ROW_NODES,3) in-frame orientation drift
+        self.ibis = ibis_rows            # image displacement at each source row
         self.vn = np.linspace(0, H, ROW_NODES)
         self.post = (0.0, 0.0, 0.0)     # visual refinement: dx, dy, roll (rad)
 
@@ -96,6 +97,12 @@ class Frame:
             cvec = np.einsum("nij,nj->ni", Rm, a)
             p = cvec @ self.K.T
             p = p[:, :2] / np.maximum(p[:, 2:3], 1e-6)
+            if self.ibis is not None:
+                sx, sy, roll = (np.interp(vc, self.vn, self.ibis[:, k]) for k in range(3))
+                pc = p - c
+                ct, st = np.cos(roll), np.sin(roll)
+                p = c + np.stack([ct * pc[:, 0] - st * pc[:, 1],
+                                  st * pc[:, 0] + ct * pc[:, 1]], 1) + np.stack([sx, sy], 1)
             v = p[:, 1]
         ok = a[:, 2] > 1e-6
         p[~ok] = -1e6
@@ -234,6 +241,14 @@ def track_frames(path, count, width, height):
     return motion, confidence
 
 
+def sample_ibis(telemetry, times):
+    """Interpolate recorded image displacement on the camera metadata timeline."""
+    if telemetry.ibis_times is None:
+        return np.zeros(np.shape(times) + (3,))
+    return np.stack([np.interp(times, telemetry.ibis_times, telemetry.ibis[:, k])
+                     for k in range(3)], axis=-1)
+
+
 def calibrate(telemetry, sampler, motion, confidence, scale, fps, count):
     """Refine the recorded sync against image motion; keep physical lens geometry."""
     focal = telemetry.focal[:count] * scale
@@ -246,19 +261,21 @@ def calibrate(telemetry, sampler, motion, confidence, scale, fps, count):
         raise ValueError('Too few reliable image tracks for gyro sync; use --offset-ms 0 to use metadata timing')
     sigma = max(1, fps*0.15)
     obs_hp = observed - gaussian_filter1d(observed, sigma, axis=0)
+    ibis_motion = np.diff(sample_ibis(telemetry, centers)[:, :2], axis=0) * scale
+    ibis_hp = ibis_motion - gaussian_filter1d(ibis_motion, sigma, axis=0)
 
     def fit(offset):
         rotations = sampler(centers + offset)
         delta = (rotations[:-1].inv()*rotations[1:]).as_rotvec()
         predicted = np.stack([-delta[:, 1]*focal[1:, 0], delta[:, 0]*focal[1:, 1]], 1)
         pred_hp = predicted - gaussian_filter1d(predicted, sigma, axis=0)
-        x, y = pred_hp[valid], obs_hp[valid]
+        x, y = pred_hp[valid], (obs_hp - ibis_hp)[valid]
         factor = np.clip(np.sum(x*y)/max(np.sum(x*x), 1e-9), 0.85, 1.15)
         residual = np.linalg.norm(y-factor*x, axis=1)
         # Trim worst 15% (moving subject, occlusion, parallax); never fit focal from scratch.
         keep = residual <= np.quantile(residual, 0.85)
         loss = np.mean((y[keep]-factor*x[keep])**2)
-        r2 = 1 - loss/max(np.mean(y[keep]**2), 1e-9)
+        r2 = 1 - loss/max(np.mean(obs_hp[valid][keep]**2), 1e-9)
         return loss, float(factor), float(r2)
 
     grid = np.linspace(-0.025, 0.025, 51)
@@ -287,6 +304,8 @@ def plan(telemetry, sampler, width, height, fps, count, offset, focal_scale,
     relative = (original.inv()*target).as_rotvec()
     readout = telemetry.readout[:count] if readout_ms is None else np.full(count, readout_ms/1000)
     row_times = centers[:, None] + np.linspace(-0.5, 0.5, ROW_NODES)*readout[:, None]
+    ibis_times = telemetry.centers[:count, None] + np.linspace(-0.5, 0.5, ROW_NODES)*readout[:, None]
+    ibis_rows = sample_ibis(telemetry, ibis_times)
     drift = (Rot.from_quat(np.repeat(original.as_quat(), ROW_NODES, axis=0)).inv()
              * sampler(row_times.ravel())).as_rotvec().reshape(count, ROW_NODES, 3)
     border = border_points(width-1, height-1, 48)
@@ -297,7 +316,8 @@ def plan(telemetry, sampler, width, height, fps, count, offset, focal_scale,
     def build(i, strength):
         k = matrices[i]
         return Frame(k, np.linalg.inv(k), width, height,
-                     Rot.from_rotvec(relative[i]*strength).as_matrix(), drift[i]*strength)
+                     Rot.from_rotvec(relative[i]*strength).as_matrix(), drift[i]*strength,
+                     ibis_rows[i]*strength if telemetry.ibis_times is not None else None)
     limits = np.ones(count)
     for i in range(count):
         if not covers(build(i, 1), border, zmax, 3):
@@ -638,6 +658,8 @@ def main(argv=None):
     sample = make_sampler(telemetry.times, integrate(telemetry.times, telemetry.rates))
     print(f'Gyro: {len(telemetry.times)} samples; recorded rate {telemetry.frequency:g} Hz; '
           f'readout {np.median(telemetry.readout)*1000:.3f} ms', flush=True)
+    if telemetry.ibis_times is not None:
+        print(f'IBIS: {len(telemetry.ibis_times)} position/roll samples', flush=True)
     factor, r2 = 1.0, None
     if args.offset_ms is None:
         print('Checking gyro sync against reliable image tracks...', flush=True)
@@ -676,6 +698,7 @@ def main(argv=None):
     report = {'input': str(args.video), 'output': str(out), 'frames': count, 'fps': fps,
               'level': args.level, 'smooth_seconds': args.smooth, 'max_crop': args.max_crop,
               'gyro_samples': len(telemetry.times), 'gyro_frequency_hz': telemetry.frequency,
+              'ibis_samples': 0 if telemetry.ibis_times is None else len(telemetry.ibis_times),
               'sensor_readout_ms': float(np.median(telemetry.readout)*1000),
               'sync_adjustment_ms': offset*1000, 'focal_scale': factor, 'sync_r2': r2,
               'focal_px': (np.median(telemetry.focal, axis=0)*factor).tolist(),

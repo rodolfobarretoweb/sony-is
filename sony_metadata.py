@@ -91,6 +91,21 @@ class Telemetry:
     focal: np.ndarray
     orientation: int
     frequency: float
+    ibis_times: np.ndarray | None = None
+    ibis: np.ndarray | None = None  # image displacement x/y in video pixels, roll in radians
+
+
+def motion_table(tags, tag, size, fmt):
+    """Decode a Sony time-offset table, including empty tables."""
+    body = tags.get(tag)
+    if body is None:
+        return None
+    if len(body) < 8:
+        raise ValueError(f'Invalid Sony motion table {tag:#x}')
+    count, item_size = struct.unpack_from('>II', body)
+    if item_size != size or len(body) != 8 + count * size:
+        raise ValueError(f'Invalid Sony motion table {tag:#x}')
+    return np.array(list(struct.iter_unpack(fmt, body[8:])), dtype=float).reshape(count, 4)
 
 
 def load_telemetry(path, index, width, height):
@@ -98,6 +113,8 @@ def load_telemetry(path, index, width, height):
         'ffprobe', '-v', 'error', '-select_streams', str(index), '-show_packets',
         '-show_entries', 'packet=pts_time,pos,size', '-of', 'json', str(path)]))['packets']
     times, rates, pts, centers, readouts, focals = [], [], [], [], [], []
+    ibis_times, ibis_values = [], []
+    ibis_present = None
     with open(path, 'rb') as video:
         for packet in packets:
             video.seek(int(packet['pos']))
@@ -136,15 +153,42 @@ def load_telemetry(path, index, width, height):
                            + readout*(origin[1]+crop[1]/2)/sensor[1])
             readouts.append(readout*crop[1]/sensor[1])
             pitch = np.array(number(tags, 0xe407, '>hh'), dtype=float)
-            pitch /= number(tags, 0xe406, '>i', 1_000_000_000)
+            pitch_unit = number(tags, 0xe406, '>i', 1_000_000_000)
+            if pitch_unit <= 0:
+                raise ValueError('Invalid pixel pitch unit')
+            pitch /= pitch_unit
             focal_m = number(tags, 0xe410, '>iii')[2]/1e9
             if focal_m <= 0 or np.any(pitch <= 0) or np.any(crop <= 0):
                 raise ValueError('Invalid lens/sensor geometry')
             focals.append(focal_m / (pitch*crop/[width, height]))
-            # This version intentionally fails closed for active optical/sensor stabilization.
-            for tag in (0xe40f, 0xe450, 0xe416):
-                if tag in tags and int.from_bytes(tags[tag][:4], 'big') > 0:
-                    raise ValueError('Active IBIS/OSS metadata is not supported by this script')
+            positions = motion_table(tags, 0xe40f, 16, '>iiii')
+            rolls = motion_table(tags, 0xe450, 10, '>ihhh')
+            optical = motion_table(tags, 0xe416, 16, '>iiii')
+            optical_missing = (optical is not None and optical.shape == (1, 4)
+                               and np.all(optical[0] == -1))
+            if optical is not None and len(optical) and not optical_missing:
+                raise ValueError('Active lens OSS metadata is not supported by this script')
+            active = positions is not None and len(positions) > 0
+            if (rolls is not None and len(rolls) > 0) != active:
+                raise ValueError('Incomplete IBIS position/roll metadata')
+            if ibis_present is not None and ibis_present != active:
+                raise ValueError('IBIS samples are missing from some frames')
+            ibis_present = active
+            if active:
+                if len(positions) != len(rolls) or not np.array_equal(positions[:, 0], rolls[:, 0]):
+                    raise ValueError('IBIS position/roll timestamps do not match')
+                ibis_unit = number(tags, 0xe40b, '>i', 1_000_000)
+                roll_scale = number(tags, 0xe402, '>f', 1000.0)
+                roll_unit = number(tags, 0xe401, '>B', 0)
+                if ibis_unit <= 0 or roll_scale <= 0 or roll_unit not in (0, 1):
+                    raise ValueError('Invalid IBIS time or angle unit')
+                ibis_times.append(p + positions[:, 0] / ibis_unit)
+                # Sony tables report sensor position. Recorded image content moves oppositely.
+                shift = -positions[:, 1:3] / (pitch * 1e9) * [width / crop[0], height / crop[1]]
+                roll = -rolls[:, 3] / roll_scale
+                if roll_unit == 0:
+                    roll = np.radians(roll)
+                ibis_values.append(np.column_stack((shift, roll)))
     if not times:
         raise ValueError('No gyro samples found')
     t, w = np.concatenate(times), np.concatenate(rates)
@@ -154,5 +198,14 @@ def load_telemetry(path, index, width, height):
     t, w = t[unique], w[unique]
     if np.max(np.diff(t)) > 0.01:
         raise ValueError('Gap in gyro samples exceeds 10 ms')
+    ibis_t = ibis_v = None
+    if ibis_times:
+        ibis_t, ibis_v = np.concatenate(ibis_times), np.concatenate(ibis_values)
+        order = np.argsort(ibis_t, kind='stable')
+        ibis_t, ibis_v = ibis_t[order], ibis_v[order]
+        unique = np.r_[True, np.diff(ibis_t) > 1e-9]
+        ibis_t, ibis_v = ibis_t[unique], ibis_v[unique]
+        if len(ibis_t) > 1 and np.max(np.diff(ibis_t)) > 0.03:
+            raise ValueError('Gap in IBIS samples exceeds 30 ms')
     return Telemetry(t, w, np.array(pts), np.array(centers), np.array(readouts),
-                     np.array(focals), orientation, hz)
+                     np.array(focals), orientation, hz, ibis_t, ibis_v)

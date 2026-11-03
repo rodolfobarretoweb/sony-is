@@ -64,6 +64,23 @@ class DesktopAppTests(unittest.TestCase):
             app.validate_request(str(self.source), str(self.output), 'balanced',
                                  str(Path(self.folder.name) / 'wrong.XML'))
 
+    def test_batch_prepares_individual_outputs_and_sidecars(self):
+        other = Path(self.folder.name) / 'second.MOV'
+        other.write_bytes(b'sample')
+        sidecar = other.with_name('secondM01.XML')
+        sidecar.write_text('<NonRealTimeMeta/>')
+        requests = app.batch_requests((str(self.source), str(other)), 'light',
+                                      str(self.output))
+        self.assertEqual(requests[0][1], self.output.resolve())
+        self.assertEqual(requests[1][1], other.with_name('second_stabilized_light.mov').resolve())
+        self.assertEqual(requests[1][2], sidecar.resolve())
+
+    def test_batch_rejects_output_matching_another_input(self):
+        other = Path(self.folder.name) / 'second.MOV'
+        other.write_bytes(b'sample')
+        with self.assertRaisesRegex(ValueError, 'already exists|matches another selected'):
+            app.batch_requests((str(self.source), str(other)), 'balanced', str(other))
+
     def test_frozen_worker_runs_same_executable_and_finds_bundled_ffmpeg(self):
         with patch.object(app.sys, 'frozen', True, create=True), \
              patch.object(app.sys, '_MEIPASS', self.folder.name, create=True):
@@ -99,6 +116,34 @@ class DesktopAppTests(unittest.TestCase):
         self.assertEqual(final['state'], 'failed')
         self.assertEqual(final['error'], 'gyro metadata missing')
         self.assertFalse(self.output.exists())
+
+    def test_batch_continues_after_failed_video(self):
+        bad = Path(self.folder.name) / 'bad.MP4'
+        good = Path(self.folder.name) / 'good.MP4'
+        bad.write_bytes(b'sample')
+        good.write_bytes(b'sample')
+        requests = app.batch_requests((str(self.source), str(bad), str(good)), 'balanced')
+        script = ('import pathlib,sys; '
+                  'source=pathlib.Path(sys.argv[1]); output=pathlib.Path(sys.argv[2]); '
+                  'fail=source.stem == "bad"; '
+                  'print("Error: bad clip" if fail else "  rendering 1/1", flush=True); '
+                  'output.write_bytes(b"video") if not fail else None; '
+                  'sys.exit(1 if fail else 0)')
+        def command(source, output, _level, _xml):
+            return [sys.executable, '-u', '-c', script, str(source), str(output)]
+        job = app.JobState()
+        with patch('app.shutil.which', return_value='/usr/bin/ffmpeg'), \
+             patch('app.backend_command', side_effect=command):
+            job.start_many(requests, 'balanced')
+            final = self.wait_for_job(job)
+        self.assertEqual(final['state'], 'failed')
+        self.assertEqual(final['done_count'], 2)
+        self.assertEqual(final['file_total'], 3)
+        self.assertEqual(len(final['failures']), 1)
+        self.assertIn('bad.MP4', final['error'])
+        self.assertTrue(requests[0][1].is_file())
+        self.assertFalse(requests[1][1].exists())
+        self.assertTrue(requests[2][1].is_file())
 
     def test_worker_entry_point_needs_no_desktop_toolkit(self):
         result = subprocess.run([sys.executable, str(app.ROOT / 'app.py'), '--worker', '--help'],

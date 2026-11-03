@@ -64,6 +64,27 @@ def validate_request(source, output, level, xml=None):
     return source_path, output_path, xml_path
 
 
+def batch_requests(sources, level, first_output='', first_xml=''):
+    """Prepare one safe export per selected original."""
+    if not sources:
+        raise ValueError('Choose at least one original Sony video.')
+    requests = []
+    for index, source in enumerate(sources):
+        output = first_output if index == 0 and first_output else suggested_output(source, level)
+        xml = first_xml if index == 0 and first_xml else matching_xml(source)
+        xml = str(xml) if xml else None
+        requests.append(validate_request(source, output, level, xml))
+    input_paths = [request[0] for request in requests]
+    output_paths = [request[1] for request in requests]
+    if len(set(input_paths)) != len(input_paths):
+        raise ValueError('The same original video was selected more than once.')
+    if len(set(output_paths)) != len(output_paths):
+        raise ValueError('Two videos would be saved to the same output filename.')
+    if set(input_paths) & set(output_paths):
+        raise ValueError('An output filename matches another selected original video.')
+    return requests
+
+
 def ffmpeg_environment():
     env = os.environ.copy()
     paths = []
@@ -107,15 +128,33 @@ class JobState:
         self.output = ''
         self.error = ''
         self.log = deque(maxlen=80)
+        self.requests = []
+        self.file_index = 0
+        self.done_count = 0
+        self.failures = []
 
     def snapshot(self):
         with self.lock:
             return {'state': self.state, 'stage': self.stage, 'current': self.current,
                     'total': self.total, 'output': self.output, 'error': self.error,
-                    'log': list(self.log)}
+                    'log': list(self.log), 'file_index': self.file_index,
+                    'file_total': len(self.requests), 'done_count': self.done_count,
+                    'source': str(self.requests[self.file_index][0]) if self.requests else '',
+                    'failures': list(self.failures)}
 
     def start(self, source, output, level, xml=None):
-        source, output, xml = validate_request(source, output, level, xml)
+        self.start_many([(source, output, xml)], level)
+
+    def start_many(self, requests, level):
+        validated = [validate_request(str(source), str(output), level,
+                                      str(xml) if xml else None)
+                     for source, output, xml in requests]
+        if not validated:
+            raise ValueError('Choose at least one original Sony video.')
+        if len({item[1] for item in validated}) != len(validated):
+            raise ValueError('Two videos would be saved to the same output filename.')
+        if {item[0] for item in validated} & {item[1] for item in validated}:
+            raise ValueError('An output filename matches another selected original video.')
         env = ffmpeg_environment()
         if not shutil.which('ffmpeg', path=env['PATH']) or not shutil.which('ffprobe', path=env['PATH']):
             raise ValueError('FFmpeg and ffprobe are missing. Install the desktop package again or add FFmpeg to PATH.')
@@ -125,28 +164,70 @@ class JobState:
             self.state = 'running'
             self.stage = 'Starting stabilization'
             self.current = self.total = 0
-            self.output = str(output)
+            self.requests = validated
+            self.file_index = 0
+            self.done_count = 0
+            self.failures = []
+            self.output = str(validated[0][1])
             self.error = ''
             self.log.clear()
         try:
-            process = subprocess.Popen(backend_command(source, output, level, xml),
-                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       text=True, encoding='utf-8', errors='replace',
-                                       bufsize=1, cwd=ROOT if not getattr(sys, 'frozen', False) else None,
-                                       env=env)
+            process = self._launch(validated[0], level, env)
         except OSError as exc:
             with self.lock:
                 self.state = 'failed'
                 self.error = str(exc)
             raise ValueError(f'Could not start stabilization: {exc}') from exc
-        threading.Thread(target=self._monitor, args=(process,), daemon=True).start()
+        threading.Thread(target=self._monitor, args=(process, level, env), daemon=True).start()
 
-    def _monitor(self, process):
+    def _launch(self, request, level, env):
+        source, output, xml = request
+        return subprocess.Popen(backend_command(source, output, level, xml),
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, encoding='utf-8', errors='replace',
+                                       bufsize=1, cwd=ROOT if not getattr(sys, 'frozen', False) else None,
+                                       env=env)
+
+    def _monitor(self, process, level, env):
+        for index, request in enumerate(self.requests):
+            if index:
+                with self.lock:
+                    self.file_index = index
+                    self.output = str(request[1])
+                    self.current = self.total = 0
+                    self.stage = 'Starting stabilization'
+                    self.log.append(f'Processing {request[0].name}')
+                try:
+                    process = self._launch(request, level, env)
+                except OSError as exc:
+                    with self.lock:
+                        self.failures.append((str(request[0]), str(exc)))
+                        self.log.append(f'Failed: {request[0].name}: {exc}')
+                    continue
+            self._monitor_one(process)
+        with self.lock:
+            if self.failures:
+                self.state = 'failed'
+                self.stage = 'Finished with errors' if len(self.requests) > 1 else 'Could not finish'
+                failed_names = ', '.join(Path(source).name for source, _ in self.failures[:3])
+                if len(self.failures) > 3:
+                    failed_names += ', …'
+                self.error = (self.failures[0][1] if len(self.requests) == 1 else
+                              f'{self.done_count} of {len(self.requests)} videos saved; '
+                              f'{len(self.failures)} failed: {failed_names}. See processing details.')
+            else:
+                self.state = 'done'
+                self.stage = 'Videos saved' if len(self.requests) > 1 else 'Video saved'
+
+    def _monitor_one(self, process):
+        last_error = ''
         for raw_line in process.stdout:
             line = raw_line.rstrip()
             if not line:
                 continue
             match = PROGRESS.match(line)
+            if line.startswith('Error:'):
+                last_error = line.removeprefix('Error: ').strip()
             with self.lock:
                 self.log.append(line)
                 if match:
@@ -163,16 +244,13 @@ class JobState:
         code = process.wait()
         with self.lock:
             if code == 0 and Path(self.output).is_file():
-                self.state = 'done'
-                self.stage = 'Video saved'
+                self.done_count += 1
                 self.current = self.total or 1
                 self.total = self.total or 1
             else:
-                self.state = 'failed'
-                errors = [line for line in self.log if line.startswith('Error:')]
-                self.error = (errors[-1].removeprefix('Error: ').strip() if errors
-                              else f'Stabilization stopped with exit code {code}. See processing details.')
-                self.stage = 'Could not finish'
+                error = last_error or f'Stabilization stopped with exit code {code}. See processing details.'
+                self.failures.append((str(self.requests[self.file_index][0]), error))
+                self.log.append(f'Failed: {self.requests[self.file_index][0].name}: {error}')
 
 
 class DesktopApp:
@@ -190,6 +268,7 @@ class DesktopApp:
         self.root.protocol('WM_DELETE_WINDOW', self._close)
         self.job = JobState()
         self.source = tk.StringVar()
+        self.sources = ()
         self.xml = tk.StringVar()
         self.output = tk.StringVar()
         self.level = tk.StringVar(value='balanced')
@@ -226,14 +305,15 @@ class DesktopApp:
         content.columnconfigure(0, weight=1)
 
         ttk.Label(content, text='Original video', style='Section.TLabel').grid(row=0, column=0, sticky='w')
-        ttk.Label(content, text='Choose the original MP4 or MOV from your Sony camera.',
-                  style='Hint.TLabel').grid(row=1, column=0, sticky='w', pady=(3, 8))
+        self.source_hint = ttk.Label(content, text='Choose one or more original MP4 or MOV videos.',
+                                     style='Hint.TLabel', wraplength=690)
+        self.source_hint.grid(row=1, column=0, sticky='w', pady=(3, 8))
         self.source_entry = self._path_row(content, 2, self.source, self._browse_source)
         self.source_entry.bind('<FocusOut>', lambda _event: self._source_changed())
 
         ttk.Label(content, text='Sony XML sidecar', style='Section.TLabel').grid(
             row=3, column=0, sticky='w', pady=(16, 0))
-        ttk.Label(content, text='Auto-filled when found beside the video; choose another XML if needed.',
+        ttk.Label(content, text='Auto-filled for the first video; each additional video uses its matching XML.',
                   style='Hint.TLabel').grid(row=4, column=0, sticky='w', pady=(3, 8))
         self.xml_entry = self._path_row(content, 5, self.xml, self._browse_xml)
 
@@ -255,8 +335,10 @@ class DesktopApp:
 
         ttk.Separator(content).grid(row=10, column=0, sticky='ew', pady=15)
         ttk.Label(content, text='Save stabilized video', style='Section.TLabel').grid(row=11, column=0, sticky='w')
-        ttk.Label(content, text='Keeps the original resolution, targets its bitrate, and copies its audio.',
-                  style='Hint.TLabel').grid(row=12, column=0, sticky='w', pady=(3, 8))
+        self.output_hint = ttk.Label(content,
+                                     text='Keeps the original resolution, targets its bitrate, and copies its audio.',
+                                     style='Hint.TLabel', wraplength=690)
+        self.output_hint.grid(row=12, column=0, sticky='w', pady=(3, 8))
         self.output_entry = self._path_row(content, 13, self.output, self._browse_output)
 
         bottom = ttk.Frame(content, style='App.TFrame')
@@ -298,10 +380,11 @@ class DesktopApp:
         return entry
 
     def _browse_source(self):
-        path = self.filedialog.askopenfilename(title='Choose original Sony video',
-                                                filetypes=[('Video files', '*.mp4 *.mov'), ('All files', '*.*')])
-        if path:
-            self.source.set(path)
+        paths = self.filedialog.askopenfilenames(title='Choose original Sony videos',
+                                                 filetypes=[('Video files', '*.mp4 *.mov'), ('All files', '*.*')])
+        if paths:
+            self.sources = tuple(paths)
+            self.source.set(paths[0])
             self._source_changed()
 
     def _browse_xml(self):
@@ -314,12 +397,26 @@ class DesktopApp:
 
     def _source_changed(self):
         source = self.source.get()
+        if not self.sources or source != self.sources[0]:
+            self.sources = (source,) if source else ()
         if source != self.last_source:
             if not self.xml.get() or self.xml.get() == self.auto_xml:
                 match = matching_xml(source) if source else None
                 self.auto_xml = str(match) if match else ''
                 self.xml.set(self.auto_xml)
             self.last_source = source
+        count = len(self.sources)
+        if count > 1:
+            names = ', '.join(Path(path).name for path in self.sources[:3])
+            if count > 3:
+                names += ', …'
+            self.source_hint.configure(text=f'{count} videos selected: {names}')
+            self.output_hint.configure(text='The output below is for the first video. Other videos save beside their originals.')
+            self.start_button.configure(text=f'Stabilize {count} videos')
+        else:
+            self.source_hint.configure(text='Choose one or more original MP4 or MOV videos.')
+            self.output_hint.configure(text='Keeps the original resolution, targets its bitrate, and copies its audio.')
+            self.start_button.configure(text='Stabilize video')
         self._suggest_output()
 
     def _browse_output(self):
@@ -343,7 +440,9 @@ class DesktopApp:
     def _start(self):
         try:
             self._source_changed()
-            self.job.start(self.source.get(), self.output.get(), self.level.get(), self.xml.get())
+            requests = batch_requests(self.sources, self.level.get(),
+                                      self.output.get(), self.xml.get())
+            self.job.start_many(requests, self.level.get())
         except ValueError as exc:
             self.messagebox.showerror('Cannot stabilize video', str(exc), parent=self.root)
             return
@@ -356,8 +455,13 @@ class DesktopApp:
                        *self.browse_buttons, *self.level_buttons):
             widget.configure(state='disabled' if running else 'normal')
         self.status_label.configure(text=snap['stage'] or 'Ready')
-        self.count_label.configure(text=(f"{snap['current']} / {snap['total']} frames"
-                                         if running and snap['total'] else ''))
+        if running and snap['file_total'] > 1:
+            file_count = f"Video {snap['file_index'] + 1} / {snap['file_total']}"
+            frame_count = f" · {snap['current']} / {snap['total']} frames" if snap['total'] else ''
+            self.count_label.configure(text=file_count + frame_count)
+        else:
+            self.count_label.configure(text=(f"{snap['current']} / {snap['total']} frames"
+                                             if running and snap['total'] else ''))
         if running and not snap['total']:
             if str(self.bar['mode']) != 'indeterminate':
                 self.bar.configure(mode='indeterminate')
@@ -369,11 +473,13 @@ class DesktopApp:
             self.bar['value'] = (100 * snap['current'] / snap['total'] if snap['total']
                                  else (100 if snap['state'] == 'done' else 0))
         if snap['state'] == 'done':
-            detail = f"Saved to {snap['output']}"
+            detail = (f"Saved {snap['done_count']} videos."
+                      if snap['file_total'] > 1 else f"Saved to {snap['output']}")
         elif snap['state'] == 'failed':
             detail = snap['error']
         elif running:
-            detail = 'Processing at full resolution. Keep this window open.'
+            detail = (f"Processing {Path(snap['source']).name} at full resolution. Keep this window open."
+                      if snap['file_total'] > 1 else 'Processing at full resolution. Keep this window open.')
         else:
             detail = 'Choose a video to begin.'
         self.detail_label.configure(text=detail)
