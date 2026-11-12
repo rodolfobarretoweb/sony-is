@@ -1,7 +1,10 @@
 """Regression checks for geometry, timing, crop continuity, and safe video IO."""
 import io
 from pathlib import Path
+import shutil
 import struct
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +33,92 @@ class StabilizationTests(unittest.TestCase):
         self.assertEqual(opts[opts.index('-profile:v')+1], 'high')
         self.assertEqual(opts[opts.index('-g')+1], '12')
         self.assertEqual(opts[opts.index('-bf')+1], '1')
+
+    def test_high422_bitrate_and_profile(self):
+        source = {'bit_rate': '400000000', 'level': 51, 'profile': 'High 4:2:2',
+                  'codec_name': 'h264', 'pix_fmt': 'yuv422p10le'}
+        s.validate_video_format(source)
+        rate = s.encoding_rate(source)
+        self.assertEqual(rate[rate.index('-b:v')+1], '400000000')
+        self.assertGreaterEqual(int(rate[rate.index('-maxrate')+1]), 400000000)
+        opts = s.compatibility_options(source, '30000/1001')
+        self.assertEqual(opts[opts.index('-profile:v')+1], 'high422')
+        intra = {**source, 'profile': 'High 4:2:2 Intra'}
+        self.assertEqual(s.encoding_rate(intra)[1], '400000000')
+        intra_opts = s.compatibility_options(intra, '30000/1001')
+        self.assertEqual(intra_opts[intra_opts.index('-g')+1], '1')
+        self.assertEqual(intra_opts[intra_opts.index('-bf')+1], '0')
+        with self.assertRaisesRegex(ValueError, 'pixel formats'):
+            s.validate_video_format({**source, 'pix_fmt': 'yuv420p10le'})
+
+    def test_hevc_422_options_preserve_source_level_and_bitrate(self):
+        source = {'codec_name': 'hevc', 'pix_fmt': 'yuv422p10le', 'profile': 'Rext',
+                  'level': 153, 'bit_rate': '200000000'}
+        s.validate_video_format(source)
+        self.assertEqual(s.encoding_rate(source), ['-b:v', '200000000'])
+        opts = s.compatibility_options(source, '60000/1001')
+        self.assertEqual(opts[opts.index('-profile:v')+1], 'main422-10')
+        self.assertIn('level-idc=5.1', opts[opts.index('-x265-params')+1])
+
+    def test_10bit_422_identity_warp_keeps_all_samples(self):
+        width, height = 64, 32
+        y = np.arange(width*height, dtype='<u2').reshape(height, width) % 1024
+        u = np.full((height, width//2), 713, dtype='<u2')
+        v = np.full((height, width//2), 411, dtype='<u2')
+        mx, my = s.dense_map(self.frame(width, height), 1, width, height)
+        data = y.tobytes() + u.tobytes() + v.tobytes()
+        self.assertEqual(s.remap_yuv_frame(data, 'yuv422p10le', width, height, mx, my), data)
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg is unavailable')
+    def test_ffmpeg_render_keeps_source_pixel_format(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for pix_fmt, profile, ffmpeg_profile, intra in (
+                    ('yuv420p', 'High', 'high', False),
+                    ('yuv422p10le', 'High 4:2:2', 'high422', False),
+                    ('yuv422p10le', 'High 4:2:2 Intra', 'high422', True)):
+                with self.subTest(pix_fmt=pix_fmt, intra=intra):
+                    name = f'{pix_fmt}-intra' if intra else pix_fmt
+                    source = Path(directory) / f'{name}-source.mov'
+                    output = Path(directory) / f'{name}-output.mov'
+                    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                                    'testsrc2=size=64x64:rate=24', '-frames:v', '2',
+                                    '-pix_fmt', pix_fmt, '-c:v', 'libx264',
+                                    '-profile:v', ffmpeg_profile, '-level:v', '3.0',
+                                    '-g', '1' if intra else '12', str(source)], check=True)
+                    stream = next(x for x in s.probe(source)['streams'] if x['codec_type'] == 'video')
+                    self.assertEqual(stream['pix_fmt'], pix_fmt)
+                    frames = [self.frame(64, 64) for _ in range(2)]
+                    s.render(source, output, frames, np.ones(2), stream, [], '24/1',
+                             64, 64, None, 'medium', False)
+                    encoded = next(x for x in s.probe(output)['streams'] if x['codec_type'] == 'video')
+                    self.assertEqual((encoded['pix_fmt'], encoded['profile'], encoded['level']),
+                                     (pix_fmt, profile, 30))
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg is unavailable')
+    def test_hevc_422_ffmpeg_render_preserves_codec_and_sample_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.mov'
+            output = Path(directory) / 'output.mov'
+            subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                            'testsrc2=size=64x64:rate=24', '-frames:v', '2',
+                            '-pix_fmt', 'yuv422p10le', '-c:v', 'libx265',
+                            '-profile:v', 'main422-10', '-tag:v', 'hvc1',
+                            '-x265-params', 'pools=none:frame-threads=1:log-level=error:'
+                                            'level-idc=5.1:colorprim=bt709:transfer=bt709:'
+                                            'colormatrix=bt709:range=limited',
+                            '-color_primaries', 'bt709', '-color_trc', 'bt709',
+                            '-colorspace', 'bt709', str(source)], check=True)
+            stream = next(x for x in s.probe(source)['streams'] if x['codec_type'] == 'video')
+            self.assertEqual((stream['codec_name'], stream['profile'], stream['pix_fmt'], stream['level']),
+                             ('hevc', 'Rext', 'yuv422p10le', 153))
+            stream['bit_rate'] = '200000000'  # typical high-bitrate camera setting
+            frames = [self.frame(64, 64) for _ in range(2)]
+            s.render(source, output, frames, np.ones(2), stream, [], '24/1',
+                     64, 64, None, 'ultrafast', False)
+            encoded = next(x for x in s.probe(output)['streams'] if x['codec_type'] == 'video')
+            for key in ('codec_name', 'profile', 'pix_fmt', 'level', 'codec_tag_string',
+                        'color_primaries', 'color_transfer', 'color_space', 'color_range'):
+                self.assertEqual(encoded[key], stream[key], key)
 
     def test_source_bitrate_is_default_and_crf_requires_opt_in(self):
         options = s.encoding_rate({'bit_rate': '98003241'})

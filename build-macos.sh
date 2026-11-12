@@ -60,12 +60,12 @@ if [ ! -d 'dist/Sony Video Stabilizer.app' ]; then
 fi
 "dist/Sony Video Stabilizer.app/Contents/MacOS/Sony Video Stabilizer" --worker --help >/dev/null
 
-rm -rf build/dmg
-mkdir -p 'build/dmg'
-cp -R 'dist/Sony Video Stabilizer.app' 'build/dmg/'
-ln -sfn /Applications 'build/dmg/Applications'
+STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sony-stabilizer-dmg.XXXXXX")"
+trap 'rm -rf "$STAGING_DIR"' 0
+cp -R 'dist/Sony Video Stabilizer.app' "$STAGING_DIR/"
+ln -s /Applications "$STAGING_DIR/Applications"
 DMG="dist/Sony-Video-Stabilizer-macos-$(uname -m).dmg"
-if hdiutil create -ov -volname 'Sony Video Stabilizer' -srcfolder 'build/dmg' "$DMG"; then
+if hdiutil create -ov -volname 'Sony Video Stabilizer' -srcfolder "$STAGING_DIR" "$DMG"; then
   echo "Created $DMG"
 else
   if [ -e "$DMG" ]; then

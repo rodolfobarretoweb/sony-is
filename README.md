@@ -31,9 +31,9 @@ python3 -m venv .venv
 
 The matching XML is detected automatically. The default output is `example/C1394_stabilized_v2.mov`. MOV keeps the original PCM audio packaging for playback compatibility. Existing files are protected; choose `-o another.mov` or explicitly use `--overwrite` to replace an export. The original cannot be used as the output.
 
-By default, encoding targets the **original video stream's bitrate** (about 50 Mbps for the A7 IV clip), and **copies every original audio track without re-encoding**. There is no default CRF compression or AAC conversion. Stabilization requires decoding, warping, and re-encoding the video; it cannot leave the video bitstream unchanged. The original H.264 codec, dimensions, frame rate, pixel format, color tags, and timecode are retained. Average bitrate can vary slightly with encoder rate control; the JSON report records both the source and measured output bitrate. The original gyro track is not copied onto altered images.
+By default, encoding targets the **original video stream's bitrate** (about 50 Mbps for the A7 IV clip), and **copies every original audio track without re-encoding**. There is no default CRF compression or AAC conversion. Stabilization requires decoding, warping, and re-encoding the video; it cannot leave the video bitstream unchanged. The original H.264 or HEVC codec, dimensions, frame rate, pixel format, color tags, and timecode are retained. Average bitrate can vary slightly with encoder rate control; the JSON report records both the source and measured output bitrate. The original gyro track is not copied onto altered images.
 
-Encoding preserves the source **H.264 profile and level**, keeps the bitrate buffer within that level's limits, and inserts a closed keyframe every half-second. The A7 IV sample uses High Level 4.2. It retains the source bitrate and original audio. MOV packaging preserves the camera's `twos` PCM audio entry.
+Encoding preserves the source **video profile and level**. H.264 encoding keeps the bitrate buffer within that level's limits. It inserts a closed keyframe every half-second for inter-frame footage and preserves all-intra encoding for H.264 High 4:2:2 Intra sources. The A7 IV sample uses H.264 High Level 4.2. Supported originals are 8-bit 4:2:0 H.264, 10-bit 4:2:2 H.264, and 10-bit 4:2:2 HEVC. MOV packaging preserves the camera's `twos` PCM audio entry.
 
 For less crop, choose a stabilization level:
 
@@ -87,7 +87,7 @@ Analyze without rendering, and save diagnostics:
 - `--readout-ms 0`: disable rolling-shutter correction. Normally leave this unset to use the recorded readout time.
 - `--focal-px`: override the lens-derived focal length in source-resolution pixels. Normally unnecessary.
 
-Audio is always copied, including the camera's original PCM audio. MOV is now the default container: it preserves this camera's `twos` PCM format tag, while FFmpeg's MP4 muxer changes it to `ipcm`. A successful software decode did not establish hardware/player compatibility for that newer packaging. The script rejects MP4 output with PCM audio and asks for MOV instead; it does not convert the audio to AAC. Explicit MP4 output remains available for sources whose audio is already compatible, such as AAC. Full exports retain the complete audio; explicit `--max-frames` previews trim it to the selected duration. This renderer accepts only 8-bit YUV420 H.264 originals to avoid silently changing the codec or bit depth of other footage.
+Audio is always copied, including the camera's original PCM audio. MOV is now the default container: it preserves this camera's `twos` PCM format tag, while FFmpeg's MP4 muxer changes it to `ipcm`. A successful software decode did not establish hardware/player compatibility for that newer packaging. The script rejects MP4 output with PCM audio and asks for MOV instead; it does not convert the audio to AAC. Explicit MP4 output remains available for sources whose audio is already compatible, such as AAC. Full exports retain the complete audio; explicit `--max-frames` previews trim it to the selected duration. Other codecs and pixel formats are rejected rather than converted silently.
 
 ## What changed
 
@@ -110,7 +110,7 @@ This version targets original, continuous, constant-frame-rate Sony clips. It su
 .venv/bin/python -m unittest -v test_stabilize test_app
 ```
 
-Tests cover identity and homography mapping, scaled pixel centers, gyro direction, irregular sample integration, crop limits during strong motion, smooth correction limits, malformed metadata, short frame reads, and the interface's path safety and processing status.
+Tests cover identity and homography mapping, scaled pixel centers, gyro direction, irregular sample integration, crop limits during strong motion, smooth correction limits, malformed metadata, short frame reads, 10-bit 4:2:2 H.264 and HEVC FFmpeg render round trips, and the interface's path safety and processing status.
 
 Metadata references used to check tag definitions and timing conventions:
 

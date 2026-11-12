@@ -23,6 +23,43 @@ STABILIZATION_LEVELS = {
     'strong': {'smooth': 0.50, 'max_crop': 0.20},
 }
 
+SUPPORTED_PIXEL_FORMATS = {'yuv420p', 'yuv422p10le'}
+
+
+def validate_video_format(stream):
+    codec, pix_fmt = stream.get('codec_name'), stream.get('pix_fmt')
+    if codec not in ('h264', 'hevc'):
+        raise ValueError('Supported Sony video codecs are H.264 and HEVC; refusing a silent codec change')
+    if pix_fmt not in SUPPORTED_PIXEL_FORMATS or (codec == 'hevc' and pix_fmt != 'yuv422p10le'):
+        raise ValueError('Supported pixel formats are H.264 8-bit YUV420 and H.264/HEVC 10-bit YUV422; '
+                         'refusing a silent pixel-format conversion')
+    if codec == 'hevc' and stream.get('profile') != 'Rext':
+        raise ValueError('This renderer supports 10-bit YUV422 HEVC with the Rext profile only')
+
+
+def remap_yuv_frame(data, pix_fmt, source_w, source_h, mx, my):
+    """Warp planar YUV without changing its chroma sampling or sample depth."""
+    chroma_h = source_h // 2 if pix_fmt == 'yuv420p' else source_h
+    dtype = np.uint8 if pix_fmt == 'yuv420p' else np.dtype('<u2')
+    ysize, csize = source_w * source_h, source_w // 2 * chroma_h
+    sample_bytes = np.dtype(dtype).itemsize
+    y = np.frombuffer(data, dtype, ysize).reshape(source_h, source_w)
+    u = np.frombuffer(data, dtype, csize, ysize * sample_bytes).reshape(chroma_h, source_w // 2)
+    v = np.frombuffer(data, dtype, csize, (ysize + csize) * sample_bytes).reshape(chroma_h, source_w // 2)
+    # FFmpeg's planar 4:2:x chroma is left-sited horizontally. For 4:2:0,
+    # average the two luma rows at each output chroma sample's vertical center.
+    cmx = mx[0::2, 0::2] / 2 if pix_fmt == 'yuv420p' else mx[:, 0::2] / 2
+    cmy = ((my[0::2, 0::2] + my[1::2, 0::2]) / 4 - 0.25
+           if pix_fmt == 'yuv420p' else my[:, 0::2])
+    warped = []
+    for plane, xmap, ymap in ((y, mx, my), (u, cmx, cmy), (v, cmx, cmy)):
+        output = cv2.remap(plane, xmap, ymap, cv2.INTER_CUBIC,
+                           borderMode=cv2.BORDER_REPLICATE)
+        if pix_fmt == 'yuv422p10le':
+            np.minimum(output, 1023, out=output)
+        warped.append(output.tobytes())
+    return b''.join(warped)
+
 
 def level_settings(level, smooth=None, max_crop=None):
     """Presets set the motion/crop tradeoff; explicit numeric options take priority."""
@@ -427,6 +464,9 @@ def encoding_rate(stream, crf=None):
     bitrate = int(stream.get('bit_rate') or 0)
     if bitrate <= 0:
         raise ValueError('Source video bitrate is unavailable; refusing to guess a lower bitrate')
+    if stream.get('codec_name') == 'hevc':
+        # x265 enforces the requested HEVC level and its VBV limits itself.
+        return ['-b:v', str(bitrate)]
     # Keep VBV within the source H.264 level, rather than letting an oversized
     # buffer auto-select Level 6.1 for a Level 5.1 camera original.
     limits = {30: (10000, 10000), 31: (14000, 14000), 32: (20000, 20000),
@@ -436,7 +476,8 @@ def encoding_rate(stream, crf=None):
     level = int(stream.get('level', 51))
     if level not in limits:
         raise ValueError(f'Unsupported H.264 level for bitrate preservation: {level}')
-    factor = 1250 if stream.get('profile', 'High') == 'High' else 1000
+    factor = {'High': 1250, 'High 4:2:2': 4000,
+              'High 4:2:2 Intra': 4000}.get(stream.get('profile', 'High'), 1000)
     max_rate, max_buffer = (x*factor for x in limits[level])
     if bitrate > max_rate:
         raise ValueError('Source bitrate exceeds its declared H.264 level')
@@ -445,15 +486,31 @@ def encoding_rate(stream, crf=None):
 
 
 def compatibility_options(stream, fps_text):
+    if stream.get('codec_name') == 'hevc':
+        level = int(stream.get('level') or 0)
+        if level < 30 or level % 30 not in (0, 3, 6):
+            raise ValueError(f'Missing or unsupported source HEVC level: {level}')
+        level_text = f'{level//30}.{(level%30)//3}'
+        gop = max(1, round(float(eval_fraction(fps_text))/2))
+        params = [f'level-idc={level_text}', f'keyint={gop}', f'min-keyint={gop}', 'scenecut=0']
+        for key, option in (('color_space', 'colormatrix'), ('color_transfer', 'transfer'),
+                            ('color_primaries', 'colorprim')):
+            if stream.get(key) not in (None, 'unknown', 'unspecified'):
+                params.append(f'{option}={stream[key]}')
+        if stream.get('color_range') in ('tv', 'pc'):
+            params.append('range=limited' if stream['color_range'] == 'tv' else 'range=full')
+        return ['-profile:v', 'main422-10', '-x265-params', ':'.join(params)]
     profiles = {'High': 'high', 'Main': 'main', 'Baseline': 'baseline',
-                'Constrained Baseline': 'baseline'}
+                'Constrained Baseline': 'baseline', 'High 4:2:2': 'high422',
+                'High 4:2:2 Intra': 'high422'}
     profile = profiles.get(stream.get('profile'))
     level = int(stream.get('level') or 0)
     if profile is None or level < 10:
         raise ValueError('Missing or unsupported source H.264 profile/level')
-    gop = max(1, round(float(eval_fraction(fps_text))/2))
+    intra = stream.get('profile') == 'High 4:2:2 Intra'
+    gop = 1 if intra else max(1, round(float(eval_fraction(fps_text))/2))
     return ['-profile:v', profile, '-level:v', f'{level//10}.{level%10}',
-            '-refs', '2', '-bf', '0' if profile == 'baseline' else '1',
+            '-refs', '2', '-bf', '0' if profile == 'baseline' or intra else '1',
             '-b-pyramid', 'none', '-g', str(gop), '-keyint_min', str(gop), '-sc_threshold', '0']
 
 
@@ -464,22 +521,27 @@ def validate_audio_container(out, audio):
 
 
 def render(path, out, frames, zoom, stream, audio, fps_text, width, height, crf, preset, overwrite):
+    validate_video_format(stream)
     if Path(out).exists() and not overwrite:
         raise ValueError(f'Output exists: {out}; choose another path or pass --overwrite')
     source_w, source_h = int(stream['width']), int(stream['height'])
+    codec = stream['codec_name']
+    pix_fmt = stream['pix_fmt']
     validate_audio_container(out, audio)
     rate_options = encoding_rate(stream, crf)
     compatibility = compatibility_options(stream, fps_text)
     # Encode to a sibling temporary file; a failed run never replaces a valid export.
     fd, temporary = tempfile.mkstemp(prefix='.stabilizing-', suffix=Path(out).suffix, dir=Path(out).parent)
     os.close(fd)
-    cmd = ['ffmpeg', '-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'yuv420p',
+    cmd = ['ffmpeg', '-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', pix_fmt,
            '-s', f'{width}x{height}', '-framerate', fps_text, '-i', '-', '-i', str(path),
            '-map', '0:v:0']
     for i in range(len(audio)):
         cmd += ['-map', f'1:a:{i}']
-    cmd += ['-map_metadata', '1', '-c:v', 'libx264', '-preset', preset,
-            '-pix_fmt', 'yuv420p'] + rate_options + compatibility
+    cmd += ['-map_metadata', '1', '-c:v', 'libx265' if codec == 'hevc' else 'libx264', '-preset', preset,
+            '-pix_fmt', pix_fmt] + rate_options + compatibility
+    if codec == 'hevc' and stream.get('codec_tag_string') in ('hvc1', 'hev1'):
+        cmd += ['-tag:v', stream['codec_tag_string']]
     for key, option in [('color_space', '-colorspace'), ('color_transfer', '-color_trc'),
                         ('color_primaries', '-color_primaries'), ('color_range', '-color_range')]:
         if stream.get(key) not in (None, 'unknown', 'unspecified'):
@@ -491,7 +553,7 @@ def render(path, out, frames, zoom, stream, audio, fps_text, width, height, crf,
                         ('color_primaries', 'colorprim'), ('color_range', 'range')]:
         if stream.get(key) not in (None, 'unknown', 'unspecified'):
             vui.append(f'{option}={stream[key]}')
-    if vui:
+    if vui and codec == 'h264':
         cmd += ['-x264-params', ':'.join(vui)]
     # Preserve encoded audio samples; never silently fall back to transcoding.
     # MOV preserves this Sony camera's original 'twos' PCM packaging. MP4
@@ -508,23 +570,16 @@ def render(path, out, frames, zoom, stream, audio, fps_text, width, height, crf,
     try:
         dec = subprocess.Popen(['ffmpeg', '-v', 'error', '-noautorotate', '-i', str(path),
             '-map', '0:v:0', '-frames:v', str(len(frames)), '-fps_mode', 'passthrough',
-            '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-'], stdout=subprocess.PIPE)
+            '-f', 'rawvideo', '-pix_fmt', pix_fmt, '-'], stdout=subprocess.PIPE)
         enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-        ysize, csize = source_w*source_h, source_w*source_h//4
+        chroma_h = source_h // 2 if pix_fmt == 'yuv420p' else source_h
+        frame_bytes = (source_w*source_h + source_w*chroma_h) * (1 if pix_fmt == 'yuv420p' else 2)
         for i, fr in enumerate(frames):
-            data = read_exact(dec.stdout, ysize+2*csize)
+            data = read_exact(dec.stdout, frame_bytes)
             if not data:
                 raise ValueError(f'Decoder stopped at frame {i}; expected {len(frames)}')
             mx, my = dense_map(fr, zoom[i], width, height)
-            y = np.frombuffer(data, np.uint8, ysize).reshape(source_h, source_w)
-            u = np.frombuffer(data, np.uint8, csize, ysize).reshape(source_h//2, source_w//2)
-            v = np.frombuffer(data, np.uint8, csize, ysize+csize).reshape(source_h//2, source_w//2)
-            # Left-sited 4:2:0 chroma: x=2u,y=2v+0.5 on the luma grid.
-            cmx = mx[0::2, 0::2]/2
-            cmy = (my[0::2, 0::2]+my[1::2, 0::2])/4-0.25
-            for plane, xmap, ymap in [(y, mx, my), (u, cmx, cmy), (v, cmx, cmy)]:
-                output = cv2.remap(plane, xmap, ymap, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-                enc.stdin.write(output.tobytes())
+            enc.stdin.write(remap_yuv_frame(data, pix_fmt, source_w, source_h, mx, my))
             if i % 50 == 0:
                 print(f'  rendering {i}/{len(frames)}', flush=True)
         dec.stdout.close()
@@ -535,8 +590,15 @@ def render(path, out, frames, zoom, stream, audio, fps_text, width, height, crf,
         video = next(s for s in check['streams'] if s['codec_type'] == 'video')
         if int(video.get('nb_frames', 0)) != len(frames):
             raise RuntimeError('Encoded frame count does not match input')
+        if video.get('codec_name') != codec:
+            raise RuntimeError('Encoder changed the source video codec')
         if video.get('level') != stream.get('level') or video.get('profile') != stream.get('profile'):
-            raise RuntimeError('Encoder changed the source H.264 profile or level')
+            raise RuntimeError('Encoder changed the source video profile or level')
+        if video.get('pix_fmt') != pix_fmt:
+            raise RuntimeError('Encoder changed the source pixel format')
+        if codec == 'hevc' and stream.get('codec_tag_string') in ('hvc1', 'hev1'):
+            if video.get('codec_tag_string') != stream['codec_tag_string']:
+                raise RuntimeError('Encoder changed the source HEVC sample entry')
         output_audio = [s for s in check['streams'] if s['codec_type'] == 'audio']
         if len(output_audio) != len(audio):
             raise RuntimeError('Output audio track count does not match input')
@@ -549,11 +611,14 @@ def render(path, out, frames, zoom, stream, audio, fps_text, width, height, crf,
                 raise RuntimeError(f'Encoder did not preserve {key}: {stream[key]}')
         os.replace(temporary, out)
         success = True
-        return {'mode': 'source_bitrate' if crf is None else 'crf',
+        result = {'mode': 'source_bitrate' if crf is None else 'crf',
                 'source_video_bitrate': int(stream.get('bit_rate') or 0),
                 'output_video_bitrate': int(video.get('bit_rate') or 0),
-                'h264_profile': video['profile'], 'h264_level': video['level'],
+                'video_codec': codec, 'video_profile': video['profile'], 'video_level': video['level'],
                 'audio': 'stream_copy', 'output_size_bytes': int(check['format']['size'])}
+        if codec == 'h264':
+            result.update(h264_profile=video['profile'], h264_level=video['level'])
+        return result
     finally:
         for process in (dec, enc):
             if process is not None and process.poll() is None:
@@ -629,10 +694,7 @@ def main(argv=None):
         raise ValueError('No Sony rtmd track. The XML alone does not contain gyro samples; use the camera original')
     if data.get('tags', {}).get('timecode'):
         video.setdefault('tags', {})['timecode'] = data['tags']['timecode']
-    if video['pix_fmt'] != 'yuv420p':
-        raise ValueError('This renderer supports 8-bit YUV420 Sony originals only; refusing a silent bit-depth conversion')
-    if video['codec_name'] != 'h264':
-        raise ValueError('This renderer preserves H.264 sources only; refusing a silent codec change')
+    validate_video_format(video)
     encoding_rate(video, args.crf)
     width, height = int(video['width']), int(video['height'])
     fps_text = video['avg_frame_rate']
